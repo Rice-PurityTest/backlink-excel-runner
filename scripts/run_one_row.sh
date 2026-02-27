@@ -5,11 +5,21 @@ set -euo pipefail
 WORKDIR="${WORKDIR:-/home/gc/.openclaw/workspace}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-CFG="${1:-$WORKDIR/skills/backlink-excel-runner/assets/task-template.json}"
+DEFAULT_CFG="$WORKDIR/skills/backlink-excel-runner/assets/task-template.json"
+RUNTIME_CFG="$WORKDIR/memory/backlink-runs/task.json"
+
+# Mode/args:
+#   run_one_row.sh [cfg.json] [mode]
+MODE="${2:-run}"
+CFG="${1:-$DEFAULT_CFG}"
+
+# Prefer current runtime config when default template is used (not in init mode).
+if [[ "$CFG" == "$DEFAULT_CFG" && -f "$RUNTIME_CFG" ]]; then
+  CFG="$RUNTIME_CFG"
+fi
 STATE="$WORKDIR/memory/backlink-runs/worker-state.json"
 ACTIVE_TASKS="$WORKDIR/memory/active-tasks.md"
 XLSX_OPS="$SCRIPT_DIR/xlsx_ops.py"
-MODE="${2:-run}"
 
 update_active_task() {
   local phase="$1"
@@ -95,6 +105,63 @@ resolve_openclaw_bin() {
   echo ""
 }
 
+cfg_read_runtime() {
+  local cfg_path="$1"
+  python3 - "$cfg_path" <<'PY'
+import json,sys
+cfg=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+rt=cfg.get('runtime',{}) or {}
+print(rt.get('sessionKey',''))
+print(rt.get('replyTo',''))
+print(rt.get('replyChannel','feishu'))
+print(rt.get('replyAccountId','default'))
+print(rt.get('skillName','backlink-excel-runner'))
+PY
+}
+
+write_runtime_cfg() {
+  local src="$1"
+  local dst="$2"
+  local session_key="$3"
+  local reply_to="$4"
+  local reply_channel="${5:-feishu}"
+  local reply_account="${6:-default}"
+  local skill_name="${7:-backlink-excel-runner}"
+  python3 - "$src" "$dst" "$session_key" "$reply_to" "$reply_channel" "$reply_account" "$skill_name" <<'PY'
+import json,sys,os
+src,dst,session_key,reply_to,reply_channel,reply_account,skill_name=sys.argv[1:8]
+cfg=json.load(open(src,'r',encoding='utf-8'))
+rt=cfg.get('runtime',{}) or {}
+if session_key:
+    rt['sessionKey']=session_key
+if reply_to:
+    rt['replyTo']=reply_to
+rt['replyChannel']=reply_channel or rt.get('replyChannel','feishu')
+rt['replyAccountId']=reply_account or rt.get('replyAccountId','default')
+rt['skillName']=skill_name or rt.get('skillName','backlink-excel-runner')
+cfg['runtime']=rt
+os.makedirs(os.path.dirname(dst),exist_ok=True)
+with open(dst,'w',encoding='utf-8') as f:
+    json.dump(cfg,f,ensure_ascii=False,indent=2)
+PY
+}
+
+ensure_runtime_session() {
+  local cfg_src="$CFG"
+  local session_key reply_to
+  local -a rt_vals
+  mapfile -t rt_vals < <(cfg_read_runtime "$cfg_src")
+  session_key="${rt_vals[0]:-}"
+  reply_to="${rt_vals[1]:-}"
+
+  if [[ -n "$session_key" && -n "$reply_to" ]]; then
+    return 0
+  fi
+
+  echo "ERROR: missing runtime.sessionKey/replyTo. Run: scripts/init_task.sh" >&2
+  return 1
+}
+
 # Compute retry-aware status when AI did not finalize the row.
 mark_retry_or_need_human() {
   local row="$1"
@@ -134,6 +201,14 @@ build_agent_prompt() {
   local url="$2"
   local run_id="$3"
   local context_json
+  local skill_name
+
+  skill_name="$(python3 - <<'PY' "$CFG"
+import json,sys
+cfg=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+print((cfg.get('runtime',{}) or {}).get('skillName') or 'backlink-excel-runner')
+PY
+)"
 
   context_json="$(python3 - <<'PY' "$CFG" "$row" "$url" "$run_id" "$XLSX_OPS"
 import json,sys,os
@@ -154,13 +229,15 @@ out={
   "brandProfilePath": cfg.get("brandProfilePath"),
   "xlsxOps": xlsx_ops,
   "browser": cfg.get("browser", {}),
+  "skillName": (cfg.get("runtime",{}) or {}).get("skillName") or "backlink-excel-runner",
 }
 print(json.dumps(out, ensure_ascii=False, indent=2))
 PY
 )"
 
   cat <<EOF
-你是 OpenClaw 的自动化 agent，负责处理 backlink-excel-runner 的单行任务。
+/skill ${skill_name}
+你是 OpenClaw 的自动化 agent，负责处理 ${skill_name} 的单行任务。
 
 任务上下文 (JSON):
 $context_json
@@ -186,30 +263,36 @@ EOF
 
 run_openclaw_agent() {
   local prompt="$1"
-  local agent_id="$2"
-  local session_id="$3"
-  local timeout_sec="${OPENCLAW_TIMEOUT_SEC:-900}"
-  local thinking="${OPENCLAW_THINKING:-high}"
+  local run_id="$2"
 
-  local -a cmd
-  cmd=("$OPENCLAW_BIN_RESOLVED" agent --message "$prompt" --timeout "$timeout_sec" --thinking "$thinking" --session-id "$session_id")
-  if [[ -n "$agent_id" ]]; then
-    cmd+=(--agent "$agent_id")
-  fi
+  local params_json
+  params_json="$(python3 - <<'PY' "$CFG" "$prompt" "$run_id"
+import json,sys
+cfg_path,message,run_id=sys.argv[1:4]
+cfg=json.load(open(cfg_path,'r',encoding='utf-8'))
+rt=cfg.get('runtime',{}) or {}
+session_key=(rt.get('sessionKey') or '').strip()
+reply_to=(rt.get('replyTo') or '').strip()
+reply_channel=(rt.get('replyChannel') or 'feishu').strip()
+reply_account=(rt.get('replyAccountId') or 'default').strip()
 
-  if "${cmd[@]}"; then
-    return 0
-  fi
+if not session_key or not reply_to:
+    raise SystemExit("missing sessionKey/replyTo")
 
-  # If agent id is invalid, retry without --agent (use default agent).
-  if [[ -n "$agent_id" ]]; then
-    echo "WARN openclaw agent failed with --agent $agent_id, retrying default agent" >&2
-    cmd=("$OPENCLAW_BIN_RESOLVED" agent --message "$prompt" --timeout "$timeout_sec" --thinking "$thinking" --session-id "$session_id")
-    "${cmd[@]}"
-    return $?
-  fi
+params={
+  "message": message,
+  "sessionKey": session_key,
+  "deliver": True,
+  "replyChannel": reply_channel,
+  "replyTo": reply_to,
+  "replyAccountId": reply_account,
+  "idempotencyKey": f"backlink-{run_id}",
+}
+print(json.dumps(params,ensure_ascii=False))
+PY
+)" || return 1
 
-  return 1
+  "$OPENCLAW_BIN_RESOLVED" gateway call agent --params "$params_json"
 }
 
 # pending count only
@@ -293,6 +376,20 @@ PY
   fi
 fi
 
+# Auto-init when no runtime task exists (first run).
+if [[ "$CFG" == "$DEFAULT_CFG" && ! -f "$RUNTIME_CFG" ]]; then
+  if [[ -t 0 ]]; then
+    if ! "$SCRIPT_DIR/init_task.sh" "$DEFAULT_CFG"; then
+      echo "init failed; abort run" >&2
+      exit 1
+    fi
+    CFG="$RUNTIME_CFG"
+  else
+    echo "No runtime task config. Run: $SCRIPT_DIR/init_task.sh" >&2
+    exit 1
+  fi
+fi
+
 # Check AI availability before claiming new rows.
 OPENCLAW_BIN_RESOLVED="$(resolve_openclaw_bin)"
 if [[ -z "$OPENCLAW_BIN_RESOLVED" ]]; then
@@ -306,6 +403,21 @@ if [[ -z "$OPENCLAW_BIN_RESOLVED" ]]; then
     write_state "IDLE" "ai_unavailable" "" "" "" "openclaw_not_found"
     update_active_task "ai_unavailable" "" ""
     echo "openclaw not found; skip claim"
+  fi
+  exit 1
+fi
+
+# Ensure session routing info exists for gateway delivery.
+if ! ensure_runtime_session; then
+  if [[ -n "$row" ]]; then
+    final_status="$(mark_retry_or_need_human "$row" "missing_session_routing" "$url")"
+    write_state "IDLE" "missing_session_routing" "$row" "$url" "$run_id" "missing_session_routing"
+    update_active_task "missing_session_routing" "$row" "$url" "$run_id"
+    echo "missing_session_routing row=$row status=$final_status"
+  else
+    write_state "IDLE" "missing_session_routing" "" "" "" "missing_session_routing"
+    update_active_task "missing_session_routing" "" ""
+    echo "missing_session_routing: sessionKey/replyTo required"
   fi
   exit 1
 fi
@@ -394,14 +506,10 @@ fi
 write_state "RUNNING" "ai_running" "$row" "$url" "$run_id" "ai_start"
 update_active_task "ai_running" "$row" "$url" "$run_id"
 
-# Run AI agent (default: main, fallback to default agent if main not found).
-AGENT_ID="${OPENCLAW_AGENT_ID:-main}"
-SESSION_ID="backlink-$(basename "$CFG")-row-${row}"
-
 prompt="$(build_agent_prompt "$row" "$url" "$run_id")"
 
 ai_ok=1
-if ! run_openclaw_agent "$prompt" "$AGENT_ID" "$SESSION_ID"; then
+if ! run_openclaw_agent "$prompt" "$run_id"; then
   ai_ok=0
 fi
 
