@@ -137,10 +137,12 @@ After each row, report:
 - `scripts/bootstrap_brand_profile.sh <config.json>`: first-run target-site bootstrap; generates `brandProfilePath` materials.
 - `scripts/run_one_row.sh <config.json>`: claim and execute one row.
   - Optional: `SITE_HOOK=/path/to/hook.sh` for domain-specific auto-finalization.
-- `scripts/self_check.sh`: heartbeat self-check + auto-resume.
-  - includes extra stuck detection: `RUNNING` but no active `agent-browser --cdp 9222` process for a grace window.
+- `scripts/run_worker.sh <config.json> [--resume]`: long-running single-worker loop (`while true`) for continuous execution.
+- `scripts/self_check.sh`: watchdog only (health-check + conditional recovery).
+  - checks worker liveness + heartbeat staleness.
+  - when abnormal, starts `run_worker.sh` with cooldown guard.
   - writes per-run summary to `memory/backlink-runs/last-status.txt`.
-  - optional status push each run via `BACKLINK_NOTIFY_CMD`.
+  - optional status push (throttled) via notify mode.
 - `scripts/cron_install.sh`: install 5-min OpenClaw cron checker.
 - `scripts/cron_remove.sh`: remove OpenClaw cron checker.
 - `scripts/cleanup_task.sh`: fully remove current task runtime (cron + active-tasks section + temp state files, recoverable in `.trash/`).

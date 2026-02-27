@@ -6,13 +6,17 @@ STATE="$WORKDIR/memory/backlink-runs/worker-state.json"
 LOG="$WORKDIR/memory/backlink-runs/self-check.log"
 STATUS_TXT="$WORKDIR/memory/backlink-runs/last-status.txt"
 RUN_ONE="$WORKDIR/skills/backlink-excel-runner/scripts/run_one_row.sh"
+RUN_WORKER="$WORKDIR/skills/backlink-excel-runner/scripts/run_worker.sh"
 CFG="$WORKDIR/memory/backlink-runs/task.json"
 if [[ ! -f "$CFG" ]]; then
   CFG="$WORKDIR/skills/backlink-excel-runner/assets/task-template.json"
 fi
 CRON_REMOVE="$WORKDIR/skills/backlink-excel-runner/scripts/cron_remove.sh"
+WORKER_PID_FILE="$WORKDIR/memory/backlink-runs/worker.pid"
+WORKER_LOG="$WORKDIR/memory/backlink-runs/worker.log"
+RESUME_META="$WORKDIR/memory/backlink-runs/resume-state.meta"
 HEARTBEAT_TIMEOUT_SEC=300
-RUNNING_WITHOUT_AGENT_BROWSER_SEC=120
+RESUME_COOLDOWN_SEC="${RESUME_COOLDOWN_SEC:-600}"
 # Optional notifier command. If BACKLINK_NOTIFY_MODE=cmd, it will be executed as:
 #   <BACKLINK_NOTIFY_CMD> "<summary_text>"
 BACKLINK_NOTIFY_CMD="${BACKLINK_NOTIFY_CMD:-}"
@@ -162,7 +166,7 @@ warns=()
 actions=()
 cdp_ok=0
 google_ok=0
-agent_browser_active=0
+worker_alive=0
 
 # browser / google quick check
 if agent-browser --cdp 9222 get url >/dev/null 2>&1; then
@@ -182,17 +186,12 @@ else
   recover_cdp || true
 fi
 
-# whether agent-browser process exists (excluding this checker)
-agent_browser_count="$(pgrep -af 'agent-browser --cdp 9222' | grep -v 'self_check.sh' | wc -l | tr -d ' ' || true)"
-if [[ "${agent_browser_count:-0}" =~ ^[0-9]+$ ]] && (( agent_browser_count > 0 )); then
-  agent_browser_active=1
-fi
-
 now=$(date +%s)
 need_resume=0
 status="IDLE"
 hb=0
 age=0
+
 if [[ -f "$STATE" ]]; then
   read -r status hb <<<"$(python3 - <<'PY' "$STATE"
 import json,sys
@@ -203,29 +202,54 @@ except:
  print('IDLE 0')
 PY
 )"
-  age=$((now-hb))
-  if [[ "$status" == "RUNNING" ]]; then
-    if (( age > HEARTBEAT_TIMEOUT_SEC )); then
-      warns+=("stale_running_${age}s")
-      echo "[$(date -Is)] stale RUNNING detected age=${age}s -> resume" >> "$LOG"
-      need_resume=1
+fi
+age=$((now-hb))
+
+# worker alive check (pidfile + process command line)
+if [[ -f "$WORKER_PID_FILE" ]]; then
+  wp="$(cat "$WORKER_PID_FILE" 2>/dev/null || true)"
+  if [[ "$wp" =~ ^[0-9]+$ ]] && kill -0 "$wp" 2>/dev/null; then
+    if ps -p "$wp" -o args= 2>/dev/null | grep -q "run_worker.sh"; then
+      worker_alive=1
     fi
-    # note: run_one_row is short-lived, so no active agent-browser process is normal between checks.
-    # avoid noisy warnings here; rely on stale RUNNING timeout for recovery.
-  else
-    need_resume=1
   fi
-else
+fi
+
+# fallback check if pid file stale/missing
+if (( worker_alive == 0 )); then
+  if pgrep -af "skills/backlink-excel-runner/scripts/run_worker.sh" >/dev/null 2>&1; then
+    worker_alive=1
+  fi
+fi
+
+if (( worker_alive == 0 )); then
+  warns+=("worker_not_running")
   need_resume=1
 fi
 
+if [[ "$status" == "RUNNING" ]] && (( age > HEARTBEAT_TIMEOUT_SEC )); then
+  warns+=("stale_running_${age}s")
+  need_resume=1
+fi
+
+# resume cooldown guard
+last_resume_ts=0
+if [[ -f "$RESUME_META" ]]; then
+  last_resume_ts="$(cat "$RESUME_META" 2>/dev/null || echo 0)"
+  [[ "$last_resume_ts" =~ ^[0-9]+$ ]] || last_resume_ts=0
+fi
+elapsed_resume=$((now-last_resume_ts))
+
 if (( need_resume == 1 )); then
-  echo "[$(date -Is)] resume: run_one_row" >> "$LOG"
-  actions+=("resume_run_one_row")
-  bash "$RUN_ONE" "$CFG" --resume >> "$LOG" 2>&1 || {
-    warns+=("run_one_row_failed")
-    echo "[$(date -Is)] run_one_row failed" >> "$LOG"
-  }
+  if (( elapsed_resume >= RESUME_COOLDOWN_SEC )); then
+    echo "[$(date -Is)] resume: start run_worker" >> "$LOG"
+    nohup bash "$RUN_WORKER" "$CFG" --resume >> "$WORKER_LOG" 2>&1 &
+    echo "$!" > "$WORKER_PID_FILE"
+    echo "$now" > "$RESUME_META"
+    actions+=("resume_run_worker")
+  else
+    warns+=("resume_cooldown_${elapsed_resume}s")
+  fi
 fi
 
 # if all done -> remove cron
@@ -239,7 +263,7 @@ fi
 
 actions_str="${actions[*]:-none}"
 warns_str="${warns[*]:-none}"
-summary="[backlink self-check] status=${status} hb_age=${age}s pending=${pending} cdp_ok=${cdp_ok} google_ok=${google_ok} agent_browser_active=${agent_browser_active} actions=${actions_str} warns=${warns_str}"
+summary="[backlink self-check] status=${status} hb_age=${age}s pending=${pending} cdp_ok=${cdp_ok} google_ok=${google_ok} worker_alive=${worker_alive} actions=${actions_str} warns=${warns_str}"
 echo "$summary" >> "$LOG"
 printf '%s\n' "$summary" > "$STATUS_TXT"
 
@@ -253,7 +277,7 @@ google_cn='已登录' if google_ok=='1' else '未登录/不可用'
 def map_action(a):
     m={
       'none':'无',
-      'resume_run_one_row':'恢复执行1行',
+      'resume_run_worker':'恢复并启动常驻worker',
       'restart_headed_service':'重启有头浏览器服务',
       'install_headed_service':'安装并启动有头服务',
       'start_headed_direct':'直接拉起有头浏览器',
@@ -272,7 +296,7 @@ def map_warn(w):
       'cdp_not_reachable':'浏览器CDP不可达',
       'cdp_recover_failed':'CDP恢复失败',
       'google_not_logged_in':'Google未登录',
-      'run_one_row_failed':'执行一行失败',
+      'worker_not_running':'常驻worker未运行',
       'headed_service_unavailable':'有头浏览器服务不可用'
     }
     return m.get(w,w)
@@ -294,7 +318,7 @@ PY
 )"
 
 # hb_age changes each run; use stable signature for throttled progress notify
-notify_sig="status=${status};pending=${pending};cdp_ok=${cdp_ok};google_ok=${google_ok};agent_browser_active=${agent_browser_active};actions=${actions_str};warns=${warns_str}"
+notify_sig="status=${status};pending=${pending};cdp_ok=${cdp_ok};google_ok=${google_ok};worker_alive=${worker_alive};actions=${actions_str};warns=${warns_str}"
 notify_progress_if_needed "$notify_text" "$notify_sig"
 
 echo "[$(date -Is)] self-check end" >> "$LOG"
