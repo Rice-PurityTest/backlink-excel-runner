@@ -1,8 +1,8 @@
 {
   "name": "backlink-job-default",
-  "filePath": "/home/gc/文档/外链列表.xlsx",
-  "sheetName": "工作表1",
-  "targetSite": "https://exactstatement.com/",
+  "filePath": "",
+  "sheetName": "",
+  "targetSite": "",
   "brandProfilePath": "/home/gc/.openclaw/workspace/memory/backlink-runs/brand-profile.json",
   "columns": {
     "url": "A",
