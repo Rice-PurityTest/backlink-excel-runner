@@ -222,7 +222,7 @@ fi
 if (( need_resume == 1 )); then
   echo "[$(date -Is)] resume: run_one_row" >> "$LOG"
   actions+=("resume_run_one_row")
-  bash "$RUN_ONE" "$CFG" >> "$LOG" 2>&1 || {
+  bash "$RUN_ONE" "$CFG" --resume >> "$LOG" 2>&1 || {
     warns+=("run_one_row_failed")
     echo "[$(date -Is)] run_one_row failed" >> "$LOG"
   }
