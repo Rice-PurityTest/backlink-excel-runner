@@ -54,6 +54,19 @@ pkill -f "skills/backlink-excel-runner/scripts/run_one_row.sh" >/dev/null 2>&1 |
 pkill -f "skills/backlink-excel-runner/scripts/self_check.sh" >/dev/null 2>&1 || true
 
 # report
-left_cron="$(crontab -l 2>/dev/null | grep -c 'backlink-excel-runner-self-check' || true)"
+left_cron="unknown"
+OPENCLAW_BIN="$(command -v openclaw 2>/dev/null || true)"
+if [[ -n "$OPENCLAW_BIN" ]]; then
+  left_cron="$(python3 - <<'PY' "$("$OPENCLAW_BIN" cron list --json 2>/dev/null || echo '[]')"
+import json,sys
+data=json.loads(sys.argv[1]) if sys.argv[1].strip() else []
+jobs=data
+if isinstance(data, dict):
+    jobs=data.get('jobs') or data.get('items') or []
+cnt=sum(1 for j in jobs if j.get('name')=='backlink-excel-runner-self-check')
+print(cnt)
+PY
+)"
+fi
 echo "cleanup_done trash=$TRASH_DIR cron_left=$left_cron"
 ls -1 "$TRASH_DIR" 2>/dev/null || true

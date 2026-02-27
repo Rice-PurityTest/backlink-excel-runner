@@ -141,14 +141,14 @@ After each row, report:
   - includes extra stuck detection: `RUNNING` but no active `agent-browser --cdp 9222` process for a grace window.
   - writes per-run summary to `memory/backlink-runs/last-status.txt`.
   - optional status push each run via `BACKLINK_NOTIFY_CMD`.
-- `scripts/cron_install.sh`: install 5-min cron checker.
-- `scripts/cron_remove.sh`: remove cron checker.
+- `scripts/cron_install.sh`: install 5-min OpenClaw cron checker.
+- `scripts/cron_remove.sh`: remove OpenClaw cron checker.
 - `scripts/cleanup_task.sh`: fully remove current task runtime (cron + active-tasks section + temp state files, recoverable in `.trash/`).
 - Cron auto-removal: self-check removes cron when all rows are finished.
 
 ### Cron policy (mandatory)
 
-- After first successful run bootstrap, **must install cron** using `scripts/cron_install.sh`.
+- After first successful run bootstrap, **must install OpenClaw cron** using `scripts/cron_install.sh`.
 - If cron is missing, the run is considered incomplete and should be reported as a setup issue.
 - Removing cron requires explicit operator instruction.
 
@@ -156,7 +156,7 @@ After each row, report:
 
 - On operator instruction like "delete current task", run `scripts/cleanup_task.sh`.
 - Cleanup scope includes:
-  - current task cron entry (`backlink-excel-runner-self-check`)
+  - current task OpenClaw cron entry (`backlink-excel-runner-self-check`)
   - current task block in `memory/active-tasks.md`
   - runtime temp files under `memory/backlink-runs/`
   - skill-generated captcha screenshots (`downloads/captcha-row-*.png`)
