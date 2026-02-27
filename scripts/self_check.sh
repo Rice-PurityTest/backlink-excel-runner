@@ -19,7 +19,7 @@ BACKLINK_NOTIFY_CMD="${BACKLINK_NOTIFY_CMD:-}"
 # Notify mode: off | system-event | feishu-direct | cmd
 BACKLINK_NOTIFY_MODE="${BACKLINK_NOTIFY_MODE:-off}"
 # Minimum interval between same-state notifications (seconds)
-BACKLINK_NOTIFY_MIN_INTERVAL_SEC="${BACKLINK_NOTIFY_MIN_INTERVAL_SEC:-900}"
+BACKLINK_NOTIFY_MIN_INTERVAL_SEC="${BACKLINK_NOTIFY_MIN_INTERVAL_SEC:-3600}"
 # For feishu-direct mode, set a chat target such as: chat:oc_xxx
 BACKLINK_NOTIFY_TARGET="${BACKLINK_NOTIFY_TARGET:-}"
 NOTIFY_META="$WORKDIR/memory/backlink-runs/notify-state.meta"
