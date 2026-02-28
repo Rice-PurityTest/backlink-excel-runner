@@ -388,6 +388,270 @@ def cmd_claim_next(cfg: dict) -> None:
     print_json({"ok": True, "row": r, "url": url, "runId": run_id, "status": status})
 
 
+def cmd_list_next_n(cfg: dict, n: int) -> None:
+    xlsx = cfg["filePath"]
+    sheet_name = cfg["sheetName"]
+    cols = cfg["columns"]
+    status_col = cols["status"]
+    url_col = cols["url"]
+    worker = cfg.get("worker", "openclaw-main")
+    lock_timeout_min = int(cfg.get("runtime", {}).get("lockTimeoutMinutes", 10))
+    max_retry_per_row = int(cfg.get("runtime", {}).get("maxRetryPerRow", 1))
+
+    zin, target, sh, sst = load_sheet(xlsx, sheet_name)
+    sheet_data = sh.find("x:sheetData", NS)
+    sst_vals = sst_values(sst)
+
+    now_dt = now_utc8()
+    dirty = False
+
+    # Serial-only guard + stale lock recycle
+    for row in sheet_data.findall("x:row", NS):
+        r = int(row.attrib.get("r", "0"))
+        if r <= 1:
+            continue
+        m = {re.sub(r"\d", "", c.attrib.get("r", "")): c for c in row.findall("x:c", NS)}
+        url = str(cell_val(m.get(url_col), sst_vals)).strip()
+        st_raw = str(cell_val(m.get(status_col), sst_vals)).strip()
+        st = st_raw.upper()
+        if not url:
+            continue
+        if st.startswith("IN_PROGRESS"):
+            info = parse_status(st_raw)
+            if info["worker"] and info["worker"] != worker:
+                if dirty:
+                    save_sheet(xlsx, target, sh, sst, sst_vals)
+                print_json(
+                    {
+                        "ok": True,
+                        "message": "in_progress_exists",
+                        "row": r,
+                        "url": url,
+                        "status": st_raw,
+                        "worker": info["worker"],
+                    }
+                )
+                return
+
+            stale = False
+            if info["ts"]:
+                try:
+                    lock_dt = datetime.datetime.fromisoformat(info["ts"])
+                    if lock_dt.tzinfo is None:
+                        lock_dt = lock_dt.replace(
+                            tzinfo=datetime.timezone(datetime.timedelta(hours=8))
+                        )
+                    age_sec = (now_dt - lock_dt).total_seconds()
+                    if age_sec >= lock_timeout_min * 60:
+                        stale = True
+                except Exception:
+                    stale = False
+
+            if stale:
+                ref = f"{status_col}{r}"
+                cell = find_cell(row, ref)
+                ts = now_dt.isoformat(timespec="seconds")
+                next_retry = info["retry"] + 1
+                if next_retry >= max_retry_per_row:
+                    set_shared(
+                        cell,
+                        f"NEED_HUMAN | reason=retry_exceeded_after_lock_timeout | retry={next_retry} | ts={ts}",
+                        sst,
+                        sst_vals,
+                    )
+                else:
+                    set_shared(
+                        cell,
+                        f"RETRY_PENDING | reason=lock_timeout | retry={next_retry} | ts={ts}",
+                        sst,
+                        sst_vals,
+                    )
+                dirty = True
+                continue
+
+            if dirty:
+                save_sheet(xlsx, target, sh, sst, sst_vals)
+            print_json(
+                {
+                    "ok": True,
+                    "message": "in_progress_exists",
+                    "row": r,
+                    "url": url,
+                    "status": st_raw,
+                    "worker": info["worker"],
+                }
+            )
+            return
+
+    rows = []
+    for row in sheet_data.findall("x:row", NS):
+        r = int(row.attrib.get("r", "0"))
+        if r <= 1:
+            continue
+        m = {re.sub(r"\d", "", c.attrib.get("r", "")): c for c in row.findall("x:c", NS)}
+        url = str(cell_val(m.get(url_col), sst_vals)).strip()
+        st_raw = str(cell_val(m.get(status_col), sst_vals)).strip()
+        st = st_raw.upper()
+        if not url:
+            continue
+        if st.startswith("IN_PROGRESS"):
+            continue
+        if st.startswith("RETRY_PENDING"):
+            mr_retry = re.search(r"retry=(\d+)", st_raw)
+            retry_val = int(mr_retry.group(1)) if mr_retry else 1
+            if retry_val >= max_retry_per_row:
+                ref = f"{status_col}{r}"
+                cell = find_cell(row, ref)
+                ts = now_dt.isoformat(timespec="seconds")
+                set_shared(
+                    cell,
+                    f"NEED_HUMAN | reason=retry_exceeded | retry={retry_val} | ts={ts}",
+                    sst,
+                    sst_vals,
+                )
+                dirty = True
+                continue
+        if st == "" or st.startswith("PENDING") or st.startswith("RETRY_PENDING"):
+            rows.append({"row": r, "url": url, "status": st_raw})
+        if len(rows) >= n:
+            break
+
+    if dirty:
+        save_sheet(xlsx, target, sh, sst, sst_vals)
+
+    if not rows:
+        print_json({"ok": True, "message": "no_pending_rows", "rows": []})
+        return
+
+    print_json({"ok": True, "rows": rows})
+
+
+def cmd_claim_row(cfg: dict, row_num: int) -> None:
+    xlsx = cfg["filePath"]
+    sheet_name = cfg["sheetName"]
+    cols = cfg["columns"]
+    status_col = cols["status"]
+    url_col = cols["url"]
+    worker = cfg.get("worker", "openclaw-main")
+    max_retry_per_row = int(cfg.get("runtime", {}).get("maxRetryPerRow", 1))
+
+    zin, target, sh, sst = load_sheet(xlsx, sheet_name)
+    sheet_data = sh.find("x:sheetData", NS)
+    sst_vals = sst_values(sst)
+
+    row = None
+    for rr in sheet_data.findall("x:row", NS):
+        if int(rr.attrib.get("r", "0")) == row_num:
+            row = rr
+            break
+    if row is None:
+        print_json({"ok": False, "message": "row_not_found", "row": row_num})
+        return
+
+    m = {re.sub(r"\d", "", c.attrib.get("r", "")): c for c in row.findall("x:c", NS)}
+    url = str(cell_val(m.get(url_col), sst_vals)).strip()
+    st_raw = str(cell_val(m.get(status_col), sst_vals)).strip()
+    st = st_raw.upper()
+
+    if not url or not re.match(r"^https?://", url, re.I):
+        ref = f"{status_col}{row_num}"
+        cell = find_cell(row, ref)
+        set_shared(cell, "SKIP | reason=empty_or_invalid_url", sst, sst_vals)
+        save_sheet(xlsx, target, sh, sst, sst_vals)
+        print_json(
+            {
+                "ok": True,
+                "message": "skipped_invalid_url",
+                "row": row_num,
+                "url": url,
+                "status": "SKIP | reason=empty_or_invalid_url",
+            }
+        )
+        return
+
+    if st.startswith("IN_PROGRESS"):
+        info = parse_status(st_raw)
+        if info["worker"] and info["worker"] != worker:
+            print_json(
+                {
+                    "ok": True,
+                    "message": "in_progress_exists",
+                    "row": row_num,
+                    "url": url,
+                    "status": st_raw,
+                    "worker": info["worker"],
+                }
+            )
+            return
+        print_json(
+            {
+                "ok": True,
+                "message": "already_in_progress",
+                "row": row_num,
+                "url": url,
+                "status": st_raw,
+            }
+        )
+        return
+
+    if st.startswith("DONE") or st.startswith("FAILED") or st.startswith("SKIP") or st.startswith("NEED_HUMAN"):
+        print_json(
+            {
+                "ok": True,
+                "message": "skipped_final",
+                "row": row_num,
+                "url": url,
+                "status": st_raw,
+            }
+        )
+        return
+
+    if st.startswith("RETRY_PENDING"):
+        mr_retry = re.search(r"retry=(\d+)", st_raw)
+        retry_val = int(mr_retry.group(1)) if mr_retry else 1
+        if retry_val >= max_retry_per_row:
+            ref = f"{status_col}{row_num}"
+            cell = find_cell(row, ref)
+            ts = now_utc8().isoformat(timespec="seconds")
+            set_shared(
+                cell,
+                f"NEED_HUMAN | reason=retry_exceeded | retry={retry_val} | ts={ts}",
+                sst,
+                sst_vals,
+            )
+            save_sheet(xlsx, target, sh, sst, sst_vals)
+            print_json(
+                {
+                    "ok": True,
+                    "message": "need_human_retry_exceeded",
+                    "row": row_num,
+                    "url": url,
+                    "status": f"NEED_HUMAN | reason=retry_exceeded | retry={retry_val} | ts={ts}",
+                }
+            )
+            return
+
+    run_id = "run-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    ts = now_utc8().isoformat(timespec="seconds")
+    prev_retry = 0
+    if st.startswith("RETRY_PENDING"):
+        mr_retry = re.search(r"retry=(\d+)", st_raw)
+        prev_retry = int(mr_retry.group(1)) if mr_retry else 1
+
+    status = (
+        f"IN_PROGRESS | runId={run_id} | worker={worker} | row={row_num} "
+        f"| retry={prev_retry} | ts={ts}"
+    )
+    ref = f"{status_col}{row_num}"
+    cell = find_cell(row, ref)
+    set_shared(cell, status, sst, sst_vals)
+    save_sheet(xlsx, target, sh, sst, sst_vals)
+
+    print_json(
+        {"ok": True, "message": "claimed", "row": row_num, "url": url, "runId": run_id, "status": status}
+    )
+
+
 def cmd_set_final(cfg: dict, row_num: int, status_text: str, landing: str) -> None:
     xlsx = cfg["filePath"]
     sheet_name = cfg["sheetName"]
@@ -475,6 +739,16 @@ def main() -> None:
         cmd_in_progress_info(cfg)
     elif mode == "claim_next":
         cmd_claim_next(cfg)
+    elif mode == "list_next_n":
+        if len(sys.argv) < 4:
+            raise SystemExit("list_next_n requires: n")
+        n = int(sys.argv[3])
+        cmd_list_next_n(cfg, n)
+    elif mode == "claim_row":
+        if len(sys.argv) < 4:
+            raise SystemExit("claim_row requires: row")
+        row_num = int(sys.argv[3])
+        cmd_claim_row(cfg, row_num)
     elif mode == "set_final":
         if len(sys.argv) < 5:
             raise SystemExit("set_final requires: row status_text [landing]")

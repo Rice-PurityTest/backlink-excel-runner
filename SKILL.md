@@ -135,12 +135,14 @@ After each row, report:
 ## Automation scripts
 
 - `scripts/bootstrap_brand_profile.sh <config.json>`: first-run target-site bootstrap; generates `brandProfilePath` materials.
-- `scripts/run_one_row.sh <config.json>`: claim and execute one row.
+- `scripts/run_one_row.sh <config.json>`: claim and execute one row (manual/debug).
   - Optional: `SITE_HOOK=/path/to/hook.sh` for domain-specific auto-finalization.
-- `scripts/run_worker.sh <config.json> [--resume]`: long-running single-worker loop (`while true`) for continuous execution.
+- `scripts/run_batch.sh <config.json> [--resume]`: batch runner (20 rows per call; agent loops internally).
+- `scripts/run_worker.sh <config.json> [--resume]`: long-running single-worker loop (`while true`) for continuous execution (calls `run_batch.sh`).
 - `scripts/self_check.sh`: watchdog only (health-check + conditional recovery).
   - checks worker liveness + heartbeat staleness.
-  - when abnormal, starts `run_worker.sh` with cooldown guard.
+  - when worker is down, starts `run_worker.sh` with cooldown guard.
+  - when heartbeat is stale, triggers agent self-check prompt (cooldown-guarded).
   - writes per-run summary to `memory/backlink-runs/last-status.txt`.
   - optional status push (throttled) via notify mode.
 - `scripts/cron_install.sh`: install 5-min OpenClaw cron checker.

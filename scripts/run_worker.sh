@@ -2,7 +2,7 @@
 set -euo pipefail
 
 WORKDIR="${WORKDIR:-/home/gc/.openclaw/workspace}"
-RUN_ONE="$WORKDIR/skills/backlink-excel-runner/scripts/run_one_row.sh"
+RUN_BATCH="$WORKDIR/skills/backlink-excel-runner/scripts/run_batch.sh"
 CFG_DEFAULT="$WORKDIR/memory/backlink-runs/task.json"
 CFG_TEMPLATE="$WORKDIR/skills/backlink-excel-runner/assets/task-template.json"
 
@@ -37,9 +37,9 @@ echo "$$" > "$PID_FILE"
 echo "[$(date -Is)] worker_start pid=$$ cfg=$CFG mode=$MODE" >> "$LOG_FILE"
 
 while true; do
-  bash "$RUN_ONE" "$CFG" "$MODE" >> "$LOG_FILE" 2>&1 || true
+  bash "$RUN_BATCH" "$CFG" "$MODE" >> "$LOG_FILE" 2>&1 || true
 
-  pending="$(bash "$RUN_ONE" "$CFG" --pending-count 2>/dev/null || echo 1)"
+  pending="$(bash "$RUN_BATCH" "$CFG" --pending-count 2>/dev/null || echo 1)"
   if [[ "$pending" =~ ^0+$ ]]; then
     echo "[$(date -Is)] worker_exit all_done pending=0" >> "$LOG_FILE"
     exit 0

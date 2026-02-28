@@ -7,6 +7,7 @@ LOG="$WORKDIR/memory/backlink-runs/self-check.log"
 STATUS_TXT="$WORKDIR/memory/backlink-runs/last-status.txt"
 RUN_ONE="$WORKDIR/skills/backlink-excel-runner/scripts/run_one_row.sh"
 RUN_WORKER="$WORKDIR/skills/backlink-excel-runner/scripts/run_worker.sh"
+XLSX_OPS="$WORKDIR/skills/backlink-excel-runner/scripts/xlsx_ops.py"
 CFG="$WORKDIR/memory/backlink-runs/task.json"
 if [[ ! -f "$CFG" ]]; then
   CFG="$WORKDIR/skills/backlink-excel-runner/assets/task-template.json"
@@ -15,8 +16,10 @@ CRON_REMOVE="$WORKDIR/skills/backlink-excel-runner/scripts/cron_remove.sh"
 WORKER_PID_FILE="$WORKDIR/memory/backlink-runs/worker.pid"
 WORKER_LOG="$WORKDIR/memory/backlink-runs/worker.log"
 RESUME_META="$WORKDIR/memory/backlink-runs/resume-state.meta"
+SELF_CHECK_META="$WORKDIR/memory/backlink-runs/self-check.meta"
 HEARTBEAT_TIMEOUT_SEC=300
 RESUME_COOLDOWN_SEC="${RESUME_COOLDOWN_SEC:-600}"
+SELF_CHECK_COOLDOWN_SEC="${SELF_CHECK_COOLDOWN_SEC:-300}"
 # Optional notifier command. If BACKLINK_NOTIFY_MODE=cmd, it will be executed as:
 #   <BACKLINK_NOTIFY_CMD> "<summary_text>"
 BACKLINK_NOTIFY_CMD="${BACKLINK_NOTIFY_CMD:-}"
@@ -37,6 +40,127 @@ if [[ -z "$OPENCLAW_BIN" ]]; then
 fi
 HEADED_SERVICE="${HEADED_SERVICE:-openclaw-headed-browser.service}"
 INSTALL_HEADED_SERVICE="$WORKDIR/skills/backlink-excel-runner/scripts/install_headed_browser_service.sh"
+BATCH_SIZE=20
+
+cfg_read_runtime() {
+  local cfg_path="$1"
+  python3 - "$cfg_path" <<'PY'
+import json,sys
+cfg=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+rt=cfg.get('runtime',{}) or {}
+print(rt.get('sessionKey',''))
+print(rt.get('replyTo',''))
+print(rt.get('replyChannel','feishu'))
+print(rt.get('replyAccountId','default'))
+print(rt.get('skillName','backlink-excel-runner'))
+PY
+}
+
+ensure_runtime_session() {
+  local cfg_src="$CFG"
+  local session_key reply_to
+  local -a rt_vals
+  mapfile -t rt_vals < <(cfg_read_runtime "$cfg_src")
+  session_key="${rt_vals[0]:-}"
+  reply_to="${rt_vals[1]:-}"
+
+  if [[ -n "$session_key" && -n "$reply_to" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+build_recovery_prompt() {
+  local run_id="$1"
+  local context_json
+  local skill_name
+
+  skill_name="$(python3 - <<'PY' "$CFG"
+import json,sys
+cfg=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+print((cfg.get('runtime',{}) or {}).get('skillName') or 'backlink-excel-runner')
+PY
+)"
+
+  context_json="$(python3 - <<'PY' "$CFG" "$run_id" "$XLSX_OPS"
+import json,sys
+cfg_path,run_id,xlsx_ops=sys.argv[1:4]
+cfg=json.load(open(cfg_path,'r',encoding='utf-8'))
+out={
+  "cfgPath": cfg_path,
+  "runId": run_id,
+  "sheetName": cfg.get("sheetName"),
+  "filePath": cfg.get("filePath"),
+  "columns": cfg.get("columns"),
+  "targetSite": cfg.get("targetSite"),
+  "brandProfilePath": cfg.get("brandProfilePath"),
+  "xlsxOps": xlsx_ops,
+  "browser": cfg.get("browser", {}),
+  "skillName": (cfg.get("runtime",{}) or {}).get("skillName") or "backlink-excel-runner",
+  "batchSize": 20,
+}
+print(json.dumps(out, ensure_ascii=False, indent=2))
+PY
+)"
+
+  cat <<EOF
+/skill ${skill_name}
+你是 OpenClaw 自动化 agent，请执行“自检+恢复”：
+1) 先检查当前是否有卡住的行：
+   python3 "$XLSX_OPS" in_progress_info "$CFG"
+2) 如果有 IN_PROGRESS 行：
+   - 尝试继续完成该行；如果不可恢复，写回 RETRY_PENDING 或 NEED_HUMAN 并说明原因。
+3) 如果没有卡住行：
+   - 从 Excel 中继续处理后续行（最多 ${BATCH_SIZE} 行一批）。
+   - 获取候选行：
+     python3 "$XLSX_OPS" list_next_n "$CFG" ${BATCH_SIZE}
+   - 每行处理前先 claim：
+     python3 "$XLSX_OPS" claim_row "$CFG" <ROW>
+4) 每行处理完成后，必须写回状态：
+   python3 "$XLSX_OPS" set_final "$CFG" <ROW> "<STATUS>" "<LANDING_URL>"
+5) 禁止留下 IN_PROGRESS 状态。
+6) 文案需贴合页面语气，不要模板化硬广。
+7) 使用 agent-browser + CDP 9222 会话完成任务。
+
+任务上下文 (JSON):
+$context_json
+EOF
+}
+
+call_openclaw_agent() {
+  local prompt="$1"
+  local run_id="$2"
+
+  local params_json
+  params_json="$(python3 - <<'PY' "$CFG" "$prompt" "$run_id"
+import json,sys
+cfg_path,message,run_id=sys.argv[1:4]
+cfg=json.load(open(cfg_path,'r',encoding='utf-8'))
+rt=cfg.get('runtime',{}) or {}
+session_key=(rt.get('sessionKey') or '').strip()
+reply_to=(rt.get('replyTo') or '').strip()
+reply_channel=(rt.get('replyChannel') or 'feishu').strip()
+reply_account=(rt.get('replyAccountId') or 'default').strip()
+
+if not session_key or not reply_to:
+    raise SystemExit("missing sessionKey/replyTo")
+
+params={
+  "message": message,
+  "sessionKey": session_key,
+  "deliver": True,
+  "replyChannel": reply_channel,
+  "replyTo": reply_to,
+  "replyAccountId": reply_account,
+  "idempotencyKey": f"backlink-selfcheck-{run_id}",
+}
+print(json.dumps(params,ensure_ascii=False))
+PY
+)" || return 1
+
+  "$OPENCLAW_BIN" gateway call agent --params "$params_json"
+}
 
 ensure_user_bus() {
   export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -188,6 +312,7 @@ fi
 
 now=$(date +%s)
 need_resume=0
+need_agent_selfcheck=0
 status="IDLE"
 hb=0
 age=0
@@ -229,8 +354,11 @@ fi
 
 if [[ "$status" == "RUNNING" ]] && (( age > HEARTBEAT_TIMEOUT_SEC )); then
   warns+=("stale_running_${age}s")
-  need_resume=1
+  need_agent_selfcheck=1
 fi
+
+# pending count (for decisions + reporting)
+pending="$(python3 "$XLSX_OPS" pending_count "$CFG" 2>/dev/null || echo 1)"
 
 # resume cooldown guard
 last_resume_ts=0
@@ -252,9 +380,34 @@ if (( need_resume == 1 )); then
   fi
 fi
 
-# if all done -> remove cron
-pending="$(bash "$RUN_ONE" "$CFG" --pending-count 2>/dev/null || echo 1)"
+# agent self-check cooldown guard
+last_selfcheck_ts=0
+if [[ -f "$SELF_CHECK_META" ]]; then
+  last_selfcheck_ts="$(cat "$SELF_CHECK_META" 2>/dev/null || echo 0)"
+  [[ "$last_selfcheck_ts" =~ ^[0-9]+$ ]] || last_selfcheck_ts=0
+fi
+elapsed_selfcheck=$((now-last_selfcheck_ts))
 
+if (( need_agent_selfcheck == 1 )); then
+  if (( elapsed_selfcheck >= SELF_CHECK_COOLDOWN_SEC )); then
+    if [[ -n "$OPENCLAW_BIN" ]] && ensure_runtime_session; then
+      run_id="selfcheck-$(date +%Y%m%d-%H%M%S)"
+      prompt="$(build_recovery_prompt "$run_id")"
+      if call_openclaw_agent "$prompt" "$run_id" >> "$LOG" 2>&1; then
+        echo "$now" > "$SELF_CHECK_META"
+        actions+=("agent_selfcheck_called")
+      else
+        warns+=("agent_selfcheck_failed")
+      fi
+    else
+      warns+=("agent_selfcheck_unavailable")
+    fi
+  else
+    warns+=("selfcheck_cooldown_${elapsed_selfcheck}s")
+  fi
+fi
+
+# if all done -> remove cron
 if [[ "$pending" =~ ^0+$ ]]; then
   echo "[$(date -Is)] all tasks finished -> removing cron" >> "$LOG"
   actions+=("all_done_remove_cron")
@@ -278,6 +431,7 @@ def map_action(a):
     m={
       'none':'无',
       'resume_run_worker':'恢复并启动常驻worker',
+      'agent_selfcheck_called':'触发agent自检/恢复',
       'restart_headed_service':'重启有头浏览器服务',
       'install_headed_service':'安装并启动有头服务',
       'start_headed_direct':'直接拉起有头浏览器',
@@ -292,12 +446,16 @@ def map_warn(w):
         return '无活跃浏览器执行进程（自动恢复）'
     if w.startswith('stale_running_'):
         return '运行状态超时（自动恢复）'
+    if w.startswith('selfcheck_cooldown_'):
+        return '自检冷却中'
     m={
       'cdp_not_reachable':'浏览器CDP不可达',
       'cdp_recover_failed':'CDP恢复失败',
       'google_not_logged_in':'Google未登录',
       'worker_not_running':'常驻worker未运行',
-      'headed_service_unavailable':'有头浏览器服务不可用'
+      'headed_service_unavailable':'有头浏览器服务不可用',
+      'agent_selfcheck_unavailable':'无法触发agent自检（openclaw/会话缺失）',
+      'agent_selfcheck_failed':'agent自检调用失败'
     }
     return m.get(w,w)
 

@@ -73,4 +73,14 @@ if [[ -n "$ids" ]]; then
   done <<<"$ids"
 fi
 
-echo "removed openclaw cron: name=$JOB_NAME"
+# 3) Backward-compat: remove legacy user crontab entries installed directly.
+current_crontab="$(crontab -l 2>/dev/null || true)"
+if [[ -n "$current_crontab" ]]; then
+  filtered="$(printf '%s\n' "$current_crontab" | grep -v "$JOB_NAME" | grep -v "skills/backlink-excel-runner/scripts/self_check.sh" || true)"
+  tmpfile="$(mktemp)"
+  printf '%s\n' "$filtered" > "$tmpfile"
+  crontab "$tmpfile"
+  rm -f "$tmpfile"
+fi
+
+echo "removed openclaw cron + legacy crontab: name=$JOB_NAME"
